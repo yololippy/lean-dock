@@ -155,15 +155,6 @@ func run() throws {
     try require(movedLights.pages[0].keys.firstIndex { $0.kind == .lights } == 10, "Light input binding follows the moved light key")
     try require(todo.remaining(at: Date(timeIntervalSince1970: 90)) == "00:00:10", "Countdown uses an absolute deadline")
     try require(todo.remaining(at: Date(timeIntervalSince1970: 101)) == "Time out", "Expired hidden-page todo remains expired")
-    let profile = temp.appendingPathComponent("fixture.sdProfile"); try FileManager.default.createDirectory(at: profile, withIntermediateDirectories: true)
-    let fixture: [String: Any] = ["DeviceUUID": "M18V25E", "Actions": ["0,2": ["UUID": "com.yololippy.streamdock.togglelights.uptime", "ActionID": "uptime"],
-        "4,0": ["UUID": "com.yololippy.streamdock.togglelights.toggle", "ActionID": "lights"],
-        "1,2": ["UUID": "vendor.unknown.action", "ActionID": "unknown", "Name": "unknown"]]]
-    try json(fixture).write(to: profile.appendingPathComponent("manifest.json"))
-    let imported = try VSDImporter.read(profile: profile)
-    try require(imported.configuration.pages[0].keys[0].kind == .uptime && imported.configuration.pages[0].keys[14].kind == .lights, "VSD bottom-up coordinates imported correctly")
-    try require(imported.warnings.count == 1 && imported.configuration.pages[0].keys[1].kind == .unsupported, "Unsupported actions remain visible")
-
     let renderer = KeyRenderer(), key = config.pages[0].keys[0], face = KeyFace(kind: .uptime, text: "21时4分", status: "fixed")
     let image = try renderer.render(key: key, face: face)
     _ = try renderer.render(key: key, face: face)

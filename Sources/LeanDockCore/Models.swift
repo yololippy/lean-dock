@@ -21,7 +21,7 @@ public enum KeyKind: String, Codable, CaseIterable {
         case .vsdCPU: return "VSD CPU"
         case .appMemory: return "LeanDock 内存"
         case .appCPU: return "LeanDock CPU"
-        case .lights: return "灯光开关"
+        case .lights: return "LED 灯环开关"
         case .notes: return "备忘录"
         case .todo: return "待办事项"
         case .unsupported: return "未支持的原动作"
@@ -78,7 +78,6 @@ public struct AppConfiguration: Codable, Equatable {
     public var schemaVersion: Int = 1
     public var device = DeviceConfiguration()
     public var pages: [DeckPage]
-    public var importedFrom: String?
     // Retained only for compatibility with 0.1.0 saved configurations; quitting never restores VSD.
     public var restoreVendorOnQuit = false
     public var connectOnLaunch = true

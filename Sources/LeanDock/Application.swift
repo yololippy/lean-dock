@@ -21,13 +21,9 @@ func runLeanDock() {
     }
 }
 
-private func initialState(store: ConfigurationStore) throws -> (AppConfiguration, UserContent, [String]) {
-    if let config = try store.loadConfiguration() { return (config.applyingNativeDefaults(), try store.loadContent(), []) }
-    if let profile = try? VSDImporter.currentProfile() {
-        let imported = try VSDImporter.read(profile: profile)
-        return (imported.configuration.applyingNativeDefaults(), imported.content, imported.warnings)
-    }
-    return (AppConfiguration.standard.applyingNativeDefaults(), .init(), [])
+private func initialState(store: ConfigurationStore) throws -> (AppConfiguration, UserContent) {
+    if let config = try store.loadConfiguration() { return (config.applyingNativeDefaults(), try store.loadContent()) }
+    return (AppConfiguration.standard.applyingNativeDefaults(), .init())
 }
 
 /// Read-only diagnostics never initialize HID or terminate another application.
@@ -50,7 +46,7 @@ private func runDiagnostics() throws -> Bool {
         guard let index = args.firstIndex(of: flag), args.indices.contains(index + 1) else { throw LeanDockError.message("缺少 \(flag) 参数。") }
         return args[index + 1]
     }
-    let store = ConfigurationStore(), (config, content, _) = try initialState(store: store)
+    let store = ConfigurationStore(), (config, content) = try initialState(store: store)
     // Diagnostic collection does not persist caches or app configuration.
     let collector = MetricCollector(), renderer = KeyRenderer()
     if args.contains("--diagnostics") {
@@ -89,7 +85,6 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate, NSWindowDel
     let store: ConfigurationStore
     var configuration: AppConfiguration
     var content: UserContent
-    var warnings: [String]
     let engine = DeckEngine()
     var sampler: SamplingLoop!
     var snapshot = MetricSnapshot()
@@ -120,7 +115,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate, NSWindowDel
     init(store: ConfigurationStore = .init()) throws {
         self.store = store
         let state = try initialState(store: store)
-        configuration = state.0; content = state.1; warnings = state.2
+        configuration = state.0; content = state.1
         super.init()
         if try store.loadConfiguration() != configuration {
             if FileManager.default.fileExists(atPath: store.configURL.path) { try store.backup() }
@@ -167,7 +162,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate, NSWindowDel
         statusItem.button?.image = NSImage(systemSymbolName: "square.grid.3x3.fill", accessibilityDescription: "LeanDock")
         let menu = NSMenu()
         for (title, action) in [("打开 LeanDock", #selector(showDashboard)), ("连接 M18", #selector(connectDevice)),
-                                ("切换灯光", #selector(toggleLights)), ("断开设备", #selector(disconnectDevice)),
+                                ("开关屏幕与灯环", #selector(toggleLights)), ("断开设备", #selector(disconnectDevice)),
                                 ("退出 LeanDock", #selector(quit))] {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: ""); item.target = self; menu.addItem(item)
         }
@@ -284,7 +279,6 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate, NSWindowDel
         auto.state = configuration.connectOnLaunch ? .on : .off; right.addArrangedSubview(auto)
         let login = NSButton(checkboxWithTitle: "登录时启动 LeanDock", target: self, action: #selector(loginChanged(_:)))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off; right.addArrangedSubview(login)
-        right.addArrangedSubview(NSButton(title: "重新导入 VSD 两页配置…", target: self, action: #selector(importVendor)))
         mainWindow = window
     }
 
@@ -303,7 +297,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate, NSWindowDel
         connectButton?.title = deviceStatus.connected ? "M18 已连接" : "连接 M18"
         memoryLabel?.stringValue = String(format: "内存用量  %.1f MiB\n驻留内存  %.1f MiB", Double(snapshot.footprintBytes) / 1048576, Double(snapshot.residentBytes) / 1048576)
         let date = snapshot.quotaUpdatedAt.map { "额度快照：\($0.prefix(19))" } ?? "额度：等待本地快照"
-        detailLabel?.stringValue = ([date] + warnings + snapshot.warnings).joined(separator: "\n")
+        detailLabel?.stringValue = ([date] + snapshot.warnings).joined(separator: "\n")
         pagePicker?.selectItem(at: page)
         let keys = configuration.pages[page].keys
         for index in keyButtons.indices {
@@ -355,7 +349,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate, NSWindowDel
         guard (0..<15).contains(position) else { return }
         let key = configuration.pages[page].keys[position]
         switch key.kind {
-        case .lights: toggleLights()
+        case .lights: engine.toggleRing()
         case .notes: openNotes(key)
         case .todo: openTodo(key)
         case .unsupported: showError("此原厂动作尚未实现：\(key.label)\n\(key.originalUUID ?? "")")
@@ -387,21 +381,6 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate, NSWindowDel
     @objc func loginChanged(_ sender: NSButton) {
         do { if sender.state == .on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } }
         catch { sender.state = SMAppService.mainApp.status == .enabled ? .on : .off; showError(error.localizedDescription) }
-    }
-    @objc func importVendor() {
-        let alert = NSAlert(); alert.messageText = "重新导入当前 VSD 场景？"
-        alert.informativeText = "LeanDock 当前配置和便签会先保存到备份目录，再用 VSD 场景重建。"
-        alert.addButton(withTitle: "备份并导入"); alert.addButton(withTitle: "取消")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        for controller in Array(notesWindows.values) { guard controller.flush() else { return }; controller.close() }
-        for controller in Array(todoWindows.values) { guard controller.flush() else { return }; controller.close() }
-        do {
-            let result = try VSDImporter.read(profile: VSDImporter.currentProfile())
-            let imported = result.configuration.applyingNativeDefaults()
-            try store.backup(); try store.save(configuration: imported, content: result.content)
-            configuration = imported; content = result.content; warnings = result.warnings; page = 0
-            pagePicker?.removeAllItems(); pagePicker?.addItems(withTitles: configuration.pages.map(\.name)); updateSampling(); refreshUI()
-        } catch { showError(error.localizedDescription) }
     }
     func writeRuntime(force: Bool = false) {
         guard force || Date().timeIntervalSince(lastDiagnosticsWrite) >= 5 else { return }; lastDiagnosticsWrite = Date()

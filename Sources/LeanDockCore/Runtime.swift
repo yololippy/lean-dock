@@ -31,6 +31,7 @@ public final class DeckEngine {
     private var configuration = DeviceConfiguration()
     private var wantsConnection = false
     private var desiredSleep = false
+    private var ringEnabled = true
     private var nextAttempt: TimeInterval = 0
     private var retryDelay: TimeInterval = 1
     private var generation = UUID()
@@ -72,11 +73,26 @@ public final class DeckEngine {
         queue.async { [self] in
             configuration.screenBrightness = max(1, min(100, screen)); configuration.ringBrightness = max(0, min(100, ring))
             guard let device, !desiredSleep else { return }
-            do { try device.write(M18Protocol.brightness(configuration.screenBrightness)); try device.write(M18Protocol.ring(configuration.ringBrightness)) }
+            do {
+                try device.write(M18Protocol.brightness(configuration.screenBrightness))
+                try device.write(M18Protocol.ring(ringEnabled ? configuration.ringBrightness : 0))
+            }
             catch { failed(error) }
         }
     }
     public func toggleLights() { queue.async { self.applyLights(on: self.desiredSleep) } }
+    public func toggleRing() {
+        queue.async { [self] in
+            guard let device else { status.message = "请先连接 M18，再控制灯环。"; publish(); return }
+            let next = !ringEnabled
+            do {
+                try device.write(M18Protocol.ring(next ? configuration.ringBrightness : 0))
+                ringEnabled = next
+                status.message = next ? "M18 已连接 · LED 灯环开启" : "M18 已连接 · LED 灯环关闭，屏幕继续更新"
+                publish()
+            } catch { failed(error) }
+        }
+    }
     public func wake() { queue.async { self.applyLights(on: true) } }
 
     public func updateFrames(_ frames: [Data]) {
@@ -113,7 +129,7 @@ public final class DeckEngine {
             Thread.sleep(forTimeInterval: 0.05)
             try candidate.write(M18Protocol.verb("DIS"))
             try candidate.write(M18Protocol.brightness(configuration.screenBrightness))
-            try candidate.write(M18Protocol.ring(configuration.ringBrightness))
+            try candidate.write(M18Protocol.ring(ringEnabled ? configuration.ringBrightness : 0))
             try candidate.write(M18Protocol.clear)
             device = candidate; sentFrames.removeAll(); input = InputGate(); retryDelay = 1
             try flush()
@@ -138,7 +154,9 @@ public final class DeckEngine {
     private func applyLights(on: Bool) {
         guard let device else { status.message = "请先连接 M18，再控制灯光。"; publish(); return }
         do {
-            try lighting.apply(on: on, config: configuration, write: device.write)
+            var lightConfiguration = configuration
+            if !ringEnabled { lightConfiguration.ringBrightness = 0 }
+            try lighting.apply(on: on, config: lightConfiguration, write: device.write)
             desiredSleep = !on; status.asleep = !on
             if on { sentFrames.removeAll(); try flush() }
             status.message = on ? "M18 已连接 · 灯光开启" : "屏幕和灯环休眠 · 再按同一 LCD 键恢复"; publish()
