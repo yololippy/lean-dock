@@ -38,21 +38,20 @@ public struct ButtonEvent {
     public let isDown: Bool
     public init(position: Int, isDown: Bool) { self.position = position; self.isDown = isDown }
 }
-public enum InputAction: Equatable { case none, activate(Int), wake }
+public enum InputAction: Equatable { case none, activate(Int), wake(Int) }
 public struct InputGate {
     private var last: [Int: Double] = [:]
     private var consumeRelease: Int?
     public init() {}
-    public mutating func accept(_ event: ButtonEvent, asleep: Bool, lightPosition: Int?, now: Double) -> InputAction {
+    public mutating func accept(_ event: ButtonEvent, asleep: Bool, now: Double) -> InputAction {
         guard (0..<18).contains(event.position) else { return .none }
         if consumeRelease == event.position {
             if !event.isDown { consumeRelease = nil }; return .none
         }
         if asleep {
-            guard event.position < 15, lightPosition == nil || lightPosition == event.position,
-                  now - (last[event.position] ?? -.infinity) >= 0.45 else { return .none }
+            guard event.position < 15, now - (last[event.position] ?? -.infinity) >= 0.45 else { return .none }
             if event.isDown { consumeRelease = event.position }
-            last[event.position] = now; return .wake
+            last[event.position] = now; return .wake(event.position)
         }
         guard !event.isDown, now - (last[event.position] ?? -.infinity) >= 0.45 else { return .none }
         last[event.position] = now; return .activate(event.position)

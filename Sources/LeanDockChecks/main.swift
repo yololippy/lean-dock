@@ -11,7 +11,7 @@ func require(_ condition: @autoclosure () throws -> Bool, _ message: String) thr
 
 func json(_ object: Any) throws -> Data { try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) }
 func quotaLine(_ used: Double, timestamp: String = "2026-10-25T10:00:00Z") throws -> Data {
-    var data = try json(["type": "event_msg", "timestamp": timestamp, "payload": ["type": "token_count", "rate_limits": ["primary": ["used_percent": used], "secondary": ["used_percent": 5]]]])
+    var data = try json(["type": "event_msg", "timestamp": timestamp, "payload": ["type": "token_count", "rate_limits": ["primary": ["used_percent": used, "window_minutes": 10_080, "resets_at": 1_793_513_553], "secondary": NSNull()]]])
     data.append(10); return data
 }
 func report(_ code: UInt8, _ down: Bool) -> Data { Data([0x41,0x43,0x4b,0,0,0x4f,0x4b,0,0,code,down ? 1 : 0]) }
@@ -36,12 +36,12 @@ func run() throws {
     try require(M18Protocol.input(Data([0x41,0x43])) == nil && M18Protocol.input(report(0xff, false)) == nil, "Ignore malformed input")
 
     var gate = InputGate()
-    try require(gate.accept(.init(position: 14, isDown: false), asleep: true, lightPosition: 14, now: 1) == .wake, "Wake from a release-only LCD report")
-    try require(gate.accept(.init(position: 14, isDown: false), asleep: false, lightPosition: 14, now: 1.1) == .none, "Wake cannot immediately toggle off")
-    try require(gate.accept(.init(position: 15, isDown: false), asleep: true, lightPosition: 14, now: 2) == .none, "Round button does not invent a sleep wake event")
-    try require(gate.accept(.init(position: 14, isDown: true), asleep: true, lightPosition: 14, now: 3) == .wake, "Wake from key-down")
-    try require(gate.accept(.init(position: 14, isDown: false), asleep: false, lightPosition: 14, now: 4) == .none, "Consume the release of a wake press even after a long hold")
-    try require(gate.accept(.init(position: 14, isDown: false), asleep: false, lightPosition: 14, now: 5) == .activate(14), "Next ordinary press remains functional")
+    try require(gate.accept(.init(position: 9, isDown: false), asleep: true, now: 1) == .wake(9), "Wake from any LCD key release")
+    try require(gate.accept(.init(position: 9, isDown: false), asleep: false, now: 1.1) == .none, "Wake cannot immediately trigger the key action")
+    try require(gate.accept(.init(position: 15, isDown: false), asleep: true, now: 2) == .none, "Round button does not invent a sleep wake event")
+    try require(gate.accept(.init(position: 14, isDown: true), asleep: true, now: 3) == .wake(14), "Wake from LCD key-down")
+    try require(gate.accept(.init(position: 14, isDown: false), asleep: false, now: 4) == .none, "Consume the release of a wake press even after a long hold")
+    try require(gate.accept(.init(position: 14, isDown: false), asleep: false, now: 5) == .activate(14), "Next ordinary press remains functional")
 
     var lights = LightingController(), writes: [Data] = []
     try lights.apply(on: false, config: .init()) { writes.append($0) }
@@ -61,7 +61,7 @@ func run() throws {
     decoder.feed(first.prefix(11)) { decoded.append($0) }
     try require(decoded.isEmpty, "Incomplete JSONL must not be parsed")
     decoder.feed(first.dropFirst(11)) { decoded.append($0) }
-    try require(decoded.count == 1 && CodexUsageReader.record(from: decoded[0])?.primaryUsed == 30, "Split JSONL record is preserved")
+    try require(decoded.count == 1 && CodexUsageReader.record(from: decoded[0])?.weeklyUsed == 30, "Split JSONL record is preserved")
     decoder.maximumLineBytes = 64; decoder.feed(Data(repeating: 65, count: 200)) { _ in }
     try require(decoder.bufferedBytes <= 64, "Oversized non-quota line cannot grow memory indefinitely")
     decoder.feed(Data([10])) { _ in }; decoder.maximumLineBytes = 1_048_576
@@ -70,12 +70,14 @@ func run() throws {
     let logs = temp.appendingPathComponent("sessions"); try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
     let log = logs.appendingPathComponent("one.jsonl"); try first.write(to: log)
     let usage = CodexUsageReader(roots: [logs]); usage.scan()
-    try require(usage.latest?.primaryUsed == 30, "Initial quota scan")
+    try require(usage.latest?.weeklyUsed == 30, "Initial quota scan")
     let handle = try FileHandle(forWritingTo: log); try handle.seekToEnd(); try handle.write(contentsOf: quotaLine(42, timestamp: "2026-10-25T11:00:00Z")); try handle.close()
-    usage.scan(); try require(usage.latest?.primaryUsed == 42, "Appended quota is incrementally read")
+    usage.scan(); try require(usage.latest?.weeklyUsed == 42, "Appended quota is incrementally read")
     try quotaLine(8, timestamp: "2026-10-25T12:00:00Z").write(to: log, options: .atomic)
-    usage.scan(); try require(usage.latest?.primaryUsed == 8, "File replacement/truncation resets cursor")
-    try require(usage.latest?.metric(now: Date(timeIntervalSince1970: 0)).text == "5h 92%\n周 95%", "Remaining quota labels")
+    usage.scan(); try require(usage.latest?.weeklyUsed == 8, "File replacement/truncation resets cursor")
+    let metric = QuotaRecord(timestamp: "now", date: Date(timeIntervalSince1970: 0), weeklyUsed: 8,
+                             weeklyResetsAt: Date(timeIntervalSince1970: 86_400)).metric(now: Date(timeIntervalSince1970: 0))
+    try require(metric.text == "周 92%\n1天0时 重置", "Weekly quota and reset countdown")
 
     let database = temp.appendingPathComponent("history.sqlite")
     var db: OpaquePointer?; sqlite3_open(database.path, &db); defer { sqlite3_close(db) }
@@ -86,7 +88,7 @@ func run() throws {
     try require(CodexStatusReader.read(database: database).text == "Codex\n忙 1", "Running Codex turn")
     sqlite3_exec(db, "INSERT INTO thread_items VALUES('a','b','agentMessage',1,'{\"phase\":\"final_answer\"}');", nil, nil, nil)
     try require(CodexStatusReader.read(database: database).text == "Codex\n待确认 1", "Waiting takes precedence")
-    try require(CodexStatusReader.read(database: temp.appendingPathComponent("absent")).text == "Codex\n?", "Unavailable status is not incorrectly ready")
+    try require(CodexStatusReader.read(database: temp.appendingPathComponent("absent")).text == "Codex\n不可用", "Unavailable status is not incorrectly ready")
 
     var legacy = AppConfiguration.standard
     legacy.restoreVendorOnQuit = true; legacy.connectOnLaunch = false

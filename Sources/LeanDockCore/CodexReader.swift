@@ -26,13 +26,46 @@ public struct JSONLDecoder {
 public struct QuotaRecord: Codable, Equatable {
     public var timestamp: String
     public var date: Date
-    public var primaryUsed: Double
-    public var secondaryUsed: Double
+    public var weeklyUsed: Double
+    public var weeklyResetsAt: Date?
+
+    private enum CodingKeys: String, CodingKey { case timestamp, date, weeklyUsed, weeklyResetsAt, primaryUsed, secondaryUsed }
+
+    public init(timestamp: String, date: Date, weeklyUsed: Double, weeklyResetsAt: Date?) {
+        self.timestamp = timestamp; self.date = date; self.weeklyUsed = weeklyUsed; self.weeklyResetsAt = weeklyResetsAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        timestamp = try values.decode(String.self, forKey: .timestamp)
+        date = try values.decode(Date.self, forKey: .date)
+        // Accept the previous cache format, where the weekly limit was `secondaryUsed`.
+        weeklyUsed = try values.decodeIfPresent(Double.self, forKey: .weeklyUsed)
+            ?? values.decodeIfPresent(Double.self, forKey: .secondaryUsed)
+            ?? values.decode(Double.self, forKey: .primaryUsed)
+        weeklyResetsAt = try values.decodeIfPresent(Date.self, forKey: .weeklyResetsAt)
+    }
+
     public func metric(now: Date) -> MetricValue {
-        let a = max(0, min(100, Int((100 - primaryUsed).rounded(.toNearestOrEven))))
-        let b = max(0, min(100, Int((100 - secondaryUsed).rounded(.toNearestOrEven))))
+        let remaining = max(0, min(100, Int((100 - weeklyUsed).rounded(.toNearestOrEven))))
         let age = now.timeIntervalSince(date)
-        return .init("5h \(a)%\n周 \(b)%", age < 3600 ? "normal" : age < 86400 ? "attention" : "alert")
+        let reset = weeklyResetsAt.map { Self.resetText($0, now: now) } ?? "--"
+        return .init("周 \(remaining)%\n\(reset) 重置", age < 3600 ? "normal" : age < 86400 ? "attention" : "alert")
+    }
+
+    private static func resetText(_ date: Date, now: Date) -> String {
+        let seconds = Int(ceil(date.timeIntervalSince(now)))
+        guard seconds > 0 else { return "即将" }
+        let days = seconds / 86_400, hours = seconds / 3_600 % 24, minutes = seconds / 60 % 60
+        if days > 0 { return "\(days)天\(hours)时" }
+        if hours > 0 { return "\(hours)时\(minutes)分" }
+        return "\(max(1, minutes))分"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(timestamp, forKey: .timestamp); try values.encode(date, forKey: .date)
+        try values.encode(weeklyUsed, forKey: .weeklyUsed); try values.encodeIfPresent(weeklyResetsAt, forKey: .weeklyResetsAt)
     }
 }
 
@@ -63,15 +96,20 @@ public final class CodexUsageReader {
               object["type"] as? String == "event_msg",
               let payload = object["payload"] as? [String: Any], payload["type"] as? String == "token_count",
               let limits = payload["rate_limits"] as? [String: Any],
-              let primary = limits["primary"] as? [String: Any], let secondary = limits["secondary"] as? [String: Any],
-              let a = primary["used_percent"] as? NSNumber, let b = secondary["used_percent"] as? NSNumber,
-              CFGetTypeID(a) != CFBooleanGetTypeID(), CFGetTypeID(b) != CFBooleanGetTypeID(),
-              a.doubleValue.isFinite, b.doubleValue.isFinite,
               let stamp = object["timestamp"] as? String else { return nil }
+        let candidates = [limits["primary"] as? [String: Any], limits["secondary"] as? [String: Any]].compactMap { $0 }
+        guard let weekly = candidates.first(where: { ($0["window_minutes"] as? NSNumber)?.intValue == 10_080 })
+                ?? (candidates.count > 1 ? candidates[1] : candidates.first),
+              let used = weekly["used_percent"] as? NSNumber,
+              CFGetTypeID(used) != CFBooleanGetTypeID(), used.doubleValue.isFinite else { return nil }
+        let resetsAt = (weekly["resets_at"] as? NSNumber).flatMap { value -> Date? in
+            guard CFGetTypeID(value) != CFBooleanGetTypeID(), value.doubleValue.isFinite else { return nil }
+            return Date(timeIntervalSince1970: value.doubleValue)
+        }
         let format = ISO8601DateFormatter(); format.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let date = format.date(from: stamp) ?? ISO8601DateFormatter().date(from: stamp)
         guard let date else { return nil }
-        return QuotaRecord(timestamp: stamp, date: date, primaryUsed: a.doubleValue, secondaryUsed: b.doubleValue)
+        return QuotaRecord(timestamp: stamp, date: date, weeklyUsed: used.doubleValue, weeklyResetsAt: resetsAt)
         }
     }
 
@@ -132,7 +170,7 @@ public enum CodexStatusReader {
     public static func read(database: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/thread_history_1.sqlite")) -> MetricValue {
         var db: OpaquePointer?
         guard sqlite3_open_v2(database.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK else {
-            if db != nil { sqlite3_close(db) }; return .init("Codex\n?", "fixed")
+            if db != nil { sqlite3_close(db) }; return .init("Codex\n不可用", "fixed")
         }
         defer { sqlite3_close(db) }
         sqlite3_busy_timeout(db, 200)
@@ -142,13 +180,13 @@ public enum CodexStatusReader {
         FROM thread_turns t WHERE lower(t.status) IN ('inprogress','in_progress','running')
         """
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return .init("Codex\n?", "fixed") }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return .init("Codex\n不可用", "fixed") }
         defer { sqlite3_finalize(statement) }
         var running = 0, waiting = 0
         while true {
             let result = sqlite3_step(statement)
             if result == SQLITE_DONE { break }
-            guard result == SQLITE_ROW else { return .init("Codex\n?", "fixed") }
+            guard result == SQLITE_ROW else { return .init("Codex\n不可用", "fixed") }
             running += 1
             if let bytes = sqlite3_column_text(statement, 0),
                let data = String(cString: bytes).data(using: .utf8),

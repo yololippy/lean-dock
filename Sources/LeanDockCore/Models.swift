@@ -21,7 +21,7 @@ public enum KeyKind: String, Codable, CaseIterable {
         case .vsdCPU: return "VSD CPU"
         case .appMemory: return "LeanDock 内存"
         case .appCPU: return "LeanDock CPU"
-        case .lights: return "LED 灯环开关"
+        case .lights: return "灯光模式切换"
         case .notes: return "备忘录"
         case .todo: return "待办事项"
         case .unsupported: return "未支持的原动作"

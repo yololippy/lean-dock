@@ -68,7 +68,6 @@ public final class DeckEngine {
             completion?()
         }
     }
-    public func setLightPosition(_ position: Int?) { queue.async { self.lightPosition = position } }
     public func setBrightness(screen: Int, ring: Int) {
         queue.async { [self] in
             configuration.screenBrightness = max(1, min(100, screen)); configuration.ringBrightness = max(0, min(100, ring))
@@ -80,18 +79,15 @@ public final class DeckEngine {
             catch { failed(error) }
         }
     }
-    public func toggleLights() { queue.async { self.applyLights(on: self.desiredSleep) } }
-    public func toggleRing() {
+    public func setLightPosition(_ position: Int?) { queue.async { self.lightPosition = position } }
+    public func toggleLights() {
         queue.async { [self] in
-            guard let device else { status.message = "请先连接 M18，再控制灯环。"; publish(); return }
-            let next = !ringEnabled
-            do {
-                try device.write(M18Protocol.ring(next ? configuration.ringBrightness : 0))
-                ringEnabled = next
-                status.message = next ? "M18 已连接 · LED 灯环开启" : "M18 已连接 · LED 灯环关闭，屏幕继续更新"
-                publish()
-            } catch { failed(error) }
+            if desiredSleep { ringEnabled = true; applyLights(on: true) }
+            else { ringEnabled = false; applyLights(on: false) }
         }
+    }
+    public func toggleRing() {
+        queue.async { self.advanceLightingMode() }
     }
     public func wake() { queue.async { self.applyLights(on: true) } }
 
@@ -159,14 +155,35 @@ public final class DeckEngine {
             try lighting.apply(on: on, config: lightConfiguration, write: device.write)
             desiredSleep = !on; status.asleep = !on
             if on { sentFrames.removeAll(); try flush() }
-            status.message = on ? "M18 已连接 · 灯光开启" : "屏幕和灯环休眠 · 再按同一 LCD 键恢复"; publish()
+            status.message = on ? (ringEnabled ? "M18 已连接 · 屏幕和灯环开启" : "M18 已连接 · 屏幕开启，LED 灯环关闭")
+                                : "屏幕和灯环休眠 · 再按 LCD 键恢复"; publish()
         } catch { failed(error) }
+    }
+    private func advanceLightingMode() {
+        guard let device else { status.message = "请先连接 M18，再切换灯光模式。"; publish(); return }
+        if desiredSleep {
+            ringEnabled = true
+            applyLights(on: true)
+            return
+        }
+        if ringEnabled {
+            do {
+                try device.write(M18Protocol.ring(0))
+                ringEnabled = false
+                status.message = "M18 已连接 · 屏幕开启，LED 灯环关闭"
+                publish()
+            } catch { failed(error) }
+        } else {
+            applyLights(on: false)
+        }
     }
     private func handle(_ event: ButtonEvent) {
         status.inputEvents += 1; status.lastPosition = event.position
-        switch input.accept(event, asleep: desiredSleep, lightPosition: lightPosition, now: ProcessInfo.processInfo.systemUptime) {
+        switch input.accept(event, asleep: desiredSleep, now: ProcessInfo.processInfo.systemUptime) {
         case .none: break
-        case .wake: applyLights(on: true)
+        case .wake(let position):
+            if position == lightPosition { advanceLightingMode() }
+            else { applyLights(on: true) }
         case .activate(let position): onActivate?(position)
         }
         publish()
